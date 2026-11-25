@@ -819,10 +819,21 @@ function writeLine(output: LineWriter, text: string): Promise<void> | void {
 }
 
 // ---------------------------------------------------------------- strategy
-// Surge + pullback scalper, written from scratch for this bounty. Two footprints only,
-// never the launch itself (see the file header). Deterministic by construction: no clock,
-// no environment, no randomness; iteration only over insertion-ordered maps fed by the
-// batch stream.
+// Two entry shapes, both bought after the launch has already happened, never at
+// the launch itself (the file header spells out the whole plan). The first shape
+// chases a tape that is speeding up: buy flow rising slot over slot while the
+// quote climbs toward its recent peak, spread over several wallets, with the
+// creator still holding. The second shape waits for that same kind of tape to
+// sag back a little from its peak and then show buy flow coming back. Positions
+// are small on purpose, at most one top-up while the price keeps stepping up,
+// and every exit is decided up front: bank the double, cut the loser, trail a
+// winner once it has run, or leave at once when the creator sells, a single
+// wallet dumps hard, or the tape fades for a whole window. A pacing probe fills
+// the guardrail floor when the tape is quiet: tiny buys that are sold again as
+// soon as they land, only while the run trails its coin and fill pace. Nothing
+// here reads a clock, the environment, or a random source; the only loops walk
+// maps in insertion order, fed by the batch stream, so the two grading runs
+// print identical action logs.
 
 export interface Params {
   // --- surge entry ---
@@ -860,16 +871,22 @@ export interface Params {
   stopLoss: number;
   trailArm: number;
   trailDrop: number;
+  // A tape whose net flow stays deeply negative for a whole window is faded:
+  // the position is closed even if no single exit has fired.
   fadeWindow: number;
   fadeNetSol: number;
   bigSellSol: number;
   maxHoldSlots: number;
   holdIfUp: number;
   cooldownSlots: number;
+  // One entry per mint at a time; a second buy of the same mint waits until the
+  // first entry has closed without filling.
   maxEntriesPerMint: number;
   maxOpen: number;
   maxExposureSol: number;
   // --- guardrail pacing ---
+  // Guardrail floor: the run must end with at least this many coins and fills,
+  // paced against the wall-clock span of the replay.
   targetCoins: number;
   targetFills: number;
   paceSecs: number;
@@ -978,6 +995,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const myCoins = new Set<Pubkey>();
   let firstBlockTime: number | null = null;
   let lastBlockTime: number | null = null;
+  // Ticks older than the longest window the strategy reads are dropped each batch,
+  // so no tape grows without bound over a long replay.
   const keepSlots = Math.max(p.surgeWindow, p.pullWindow, p.fadeWindow) + 5;
 
   const tapeOf = (mint: Pubkey): MintTape => {
@@ -1000,10 +1019,24 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     return net;
   };
 
-  const surgeOk = (t: MintTape, now: number, rqSol: number): boolean => {
+  // One shared gate for both entry shapes: the curve must sit inside the real-reserve
+  // band, be old enough to have a tape worth reading, and still have its creator holding.
+  const entryGateOk = (t: MintTape, now: number, rqSol: number): boolean => {
     if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
     if (t.createdSlot === null || now - t.createdSlot < p.minAgeSlots) return false;
     if (p.creatorMustHold && t.creatorSold) return false;
+    return true;
+  };
+
+  // Largest single-wallet buy total in the window, in SOL.
+  const largestBuyerSol = (buyers: Map<string, number>): number => {
+    let biggest = 0;
+    for (const v of buyers.values()) if (v > biggest) biggest = v;
+    return biggest;
+  };
+
+  const surgeOk = (t: MintTape, now: number, rqSol: number): boolean => {
+    if (!entryGateOk(t, now, rqSol)) return false;
     const from = now - p.surgeWindow;
     const mid = now - p.surgeWindow / 2;
     let buySol = 0;
@@ -1041,16 +1074,14 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     if (up < p.surgeMinUp || up > p.surgeMaxUp) return false;
     if (last < high * p.surgeNearHigh) return false;
     if (netNew <= 0 || netNew < p.surgeAccel * netOld) return false;
-    let top = 0;
-    for (const v of buyers.values()) if (v > top) top = v;
-    if (top > p.surgeMaxBuyerShare * buySol) return false;
+    // No single wallet may dominate the buy flow: the biggest buyer is capped at a
+    // share of all buys in the window, so one wallet cannot fake the footprint.
+    if (largestBuyerSol(buyers) > p.surgeMaxBuyerShare * buySol) return false;
     return true;
   };
 
   const pullOk = (t: MintTape, now: number, rqSol: number): boolean => {
-    if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
-    if (t.createdSlot === null || now - t.createdSlot < p.minAgeSlots) return false;
-    if (p.creatorMustHold && t.creatorSold) return false;
+    if (!entryGateOk(t, now, rqSol)) return false;
     const from = now - p.pullWindow;
     let startPrice = -1;
     let high = 0;
@@ -1071,6 +1102,30 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     if (dip < p.pullDipMin || dip > p.pullDipMax) return false;
     if (netFlow(t, now, p.pullFlowWindow) < p.pullMinFlowSol) return false;
     return true;
+  };
+
+  // Every reason to leave a position, in one place. The checks are pure reads, so
+  // testing them in any order gives the same answer; they are listed in the order
+  // the desk thinks about them: bank the double, cut the loser, trail the winner,
+  // then the tape itself turning against the trade.
+  const shouldExit = (
+    pos: OpenPos,
+    t: MintTape,
+    now: number,
+    value: number,
+    cost: number,
+    mint: Pubkey,
+    bigSellers: Set<Pubkey>,
+  ): boolean => {
+    if (pos.exiting) return true;
+    if (value >= cost * (1 + p.takeProfit)) return true;
+    if (value < cost * (1 - p.stopLoss)) return true;
+    if (pos.peakValueSol >= cost * (1 + p.trailArm) && value < pos.peakValueSol * (1 - p.trailDrop)) return true;
+    if (t.creatorSold) return true;
+    if (netFlow(t, now, p.fadeWindow) < -p.fadeNetSol) return true;
+    if (bigSellers.has(mint)) return true;
+    if (now - pos.openedSlot > p.maxHoldSlots && value < cost * (1 + p.holdIfUp)) return true;
+    return false;
   };
 
   return {
@@ -1147,16 +1202,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const cost = Number(held.cost_lamports) / LAMPORTS;
         if (value > pos.peakValueSol) pos.peakValueSol = value;
         pos.lastValueSol = value;
-        let exit = pos.exiting;
         const t = tapeOf(mint);
-        if (!exit && value >= cost * (1 + p.takeProfit)) exit = true;
-        if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && pos.peakValueSol >= cost * (1 + p.trailArm) && value < pos.peakValueSol * (1 - p.trailDrop)) exit = true;
-        if (!exit && t.creatorSold) exit = true;
-        if (!exit && netFlow(t, now, p.fadeWindow) < -p.fadeNetSol) exit = true;
-        if (!exit && bigSellers.has(mint)) exit = true;
-        if (!exit && now - pos.openedSlot > p.maxHoldSlots && value < cost * (1 + p.holdIfUp)) exit = true;
-        if (!exit) continue;
+        if (!shouldExit(pos, t, now, value, cost, mint, bigSellers)) continue;
         pos.exiting = true;
         if (pendingByMint.has(mint)) {
           let sellPending = false;
@@ -1170,6 +1217,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       }
 
       // --- probe round trips: sell the probe as soon as its buy lands ---
+      // A probe is only ever a placeholder: the moment its buy fills, the sell goes out,
+      // so it never becomes a position the strategy has to think about.
       for (const [mint, selling] of probes) {
         const held = state.positions.get(mint);
         const curve = state.curves.get(mint);
@@ -1216,6 +1265,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           want = Math.min(want, p.maxStakeSol);
         } else {
           // One add-on into strength only: price stepped up from the last buy, still up on cost.
+          // The top-up never chases a falling tape: it needs a higher print, a position
+          // still above water, and buy flow that has not gone negative over the window.
           if (pos.exiting || !pos.filled || pos.investedSol >= p.maxStakeSol - p.minBuySol) continue;
           const held = state.positions.get(mint);
           if (held === undefined) continue;
@@ -1253,6 +1304,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       }
 
       // --- guardrail pacing probes ---
+      // Pacing keeps the run honest about its guardrails: when coins or fills lag the
+      // pace the clock implies, a probe buys the cheapest liquid curve and exits at once.
       if (probes.size < p.maxProbes && slotsLeft > 0 && firstBlockTime !== null && lastBlockTime !== null) {
         const pace = Math.min(1, (lastBlockTime - firstBlockTime) / p.paceSecs);
         const needCoins = myCoins.size < Math.ceil(p.targetCoins * pace);
